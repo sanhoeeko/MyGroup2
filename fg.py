@@ -1,95 +1,23 @@
-import pickle as pkl
+from collections.abc import Iterable
 
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.colors import ListedColormap
-from numba import njit
 
 import art
-
-
-class DictList:
-    def __init__(self):
-        self.dic = {}
-        self.mapping_list = []
-
-    def append(self, key, value):
-        if key not in self.dic.keys():
-            self.dic[key] = [len(self)]
-            self.mapping_list.append(value)
-        else:
-            self.dic[key].append(len(self))
-            self.mapping_list.append(value)
-
-    def tolist(self):
-        return self.mapping_list
-
-    def __len__(self):
-        return len(self.mapping_list)
-
-    def index(self, query_key, query_value) -> int:
-        if query_key not in self.dic.keys():
-            return -1
-        else:
-            for idx in self.dic[query_key]:
-                if np.all(self.mapping_list[idx] == query_value):
-                    return idx
-            return -1
-
-
-def _mul_table_aux_py(lst: np.ndarray, T: np.ndarray):
-    n = lst.shape[0]
-    trace_map = np.einsum('mnii->mn', T).astype(np.int32)
-    traces = trace_map[0]  # assume that the first element is the identity element
-    dic = DictList()
-    for i in range(n):
-        dic.append(traces[i], lst[i])
-    table = np.zeros((n, n), dtype=np.int32)
-    for i in range(n):
-        for j in range(n):
-            Tij = T[i, j, :, :]
-            trTij = trace_map[i, j]
-            k = dic.index(trTij, Tij)
-            if k == -1:
-                table[i, j] = len(dic)
-                dic.append(trTij, Tij)
-            else:
-                table[i, j] = k
-    return np.asarray(dic.tolist()), table
-
-
-@njit
-def _mul_table_aux(lst: np.ndarray[np.complex64], T: np.ndarray[np.complex64]):
-    n = lst.shape[0]
-    arr = np.zeros((65536, T.shape[2], T.shape[3]), dtype=np.complex64)
-    arr[:lst.shape[0], :, :] = lst
-    table = np.zeros((n, n), dtype=np.int32)
-    current_length = n
-    for i in range(n):
-        for j in range(n):
-            Tij = T[i, j, :, :]
-            flag = 0
-            for k in range(current_length):
-                if np.all(Tij == arr[k, :, :]):
-                    table[i, j] = k
-                    flag = 1
-                    break
-            if flag == 0:
-                table[i, j] = current_length
-                arr[current_length, :, :] = Tij
-                current_length += 1
-    return arr[:current_length, :, :], table
+import data
+import tricks
 
 
 def mulTable(lst: list[np.ndarray]) -> (np.ndarray, np.ndarray):
     A = np.asarray(lst, dtype=np.complex64)
     T = np.einsum('mij,njk->mnik', A, A).astype(np.complex64)
-    arr, table = _mul_table_aux(A, T)
+    arr, table = tricks._mul_table_aux(A, T)
     return arr, table
 
 
-def groupMulTable(lst: list[np.ndarray]):
-    elements = lst
+def makeFiniteGroup(generators: list[np.ndarray]):
+    elements = list(map(np.asarray, generators))
     n = len(elements)
     while True:
         elements, table = mulTable(elements)
@@ -105,10 +33,17 @@ def groupMulTable(lst: list[np.ndarray]):
 class Element:
     def __init__(self, group, idx):
         self.group = group
-        self.idx = idx
+        self.idx = idx[0] if isinstance(idx, Iterable) else idx
 
     def __mul__(self, o: 'Element') -> 'Element':
         return self.group[self.group.table[self.idx, o.idx]]
+
+    def __repr__(self):
+        return str(self.group.matrix_elements[self.idx])
+
+    @property
+    def inv(self):
+        return self.group[np.where(self.group.rmul(self.idx) == 0)[0]]
 
 
 class FiniteGroup:
@@ -166,7 +101,7 @@ class FiniteGroup:
                 return None
         return self.subgroup(indices)
 
-    def coset(self, indices: list[int]) -> np.ndarray:
+    def cosets(self, indices: list[int]) -> np.ndarray:
         # return: a 2d matrix, each line is a coset (represented by indices)
         assert self.subgroup(indices) is not None
         res = []
@@ -181,13 +116,13 @@ class FiniteGroup:
         return self
 
     def groupByCoset(self, indices: list[int]):
-        return self.sortByCoset(self.coset(indices)).rename()
+        return self.sortByCoset(self.cosets(indices)).rename()
 
     def quotient(self, indices: list[int]) -> 'FiniteGroup':
         assert self.invariantSubgroup(indices) is not None
         n = len(indices)
         m = len(self) // n
-        coset = self.coset(indices)
+        coset = self.cosets(indices)
         self.sortByCoset(coset)
         table = self.Table[::n, ::n]
         res = np.zeros_like(table)
@@ -196,7 +131,38 @@ class FiniteGroup:
                 res[table == coset[i, j]] = i
         return FiniteGroup(self.matrix_elements[coset[:, 0], :, :], res)
 
-    def rename(self):  # bug
+    def centralizer(self, g=None):
+        """
+        :param g: int (an element) or list[int] (elements)
+        :return: C_G(g), the centralizer of g in group G,
+        defined as {a in G | ag = ga}
+        """
+        if g is None:
+            g = list(range(len(self)))
+        gG = self.rmul(g)
+        Gg = self.lmul(g).T
+        if isinstance(g, Iterable):
+            return [np.where(gG[i] == Gg[i])[0] for i in range(len(g))]
+        else:
+            return np.where(gG == Gg)[0]
+
+    def conjugateClassOf(self, g: int) -> list[int]:
+        cent = self.centralizer(g)
+        H = self.cosets(cent)
+        return [(self[H[i, 0]] * self[g] * self[H[i, 0]].inv).idx for i in range(H.shape[0])]
+
+    def conjugateClasses(self):
+        def flatten(llst):
+            return [i for lst in llst for i in lst]
+
+        lst = []
+        for g in range(len(self)):
+            if g in flatten(lst): continue
+            lst.append(self.conjugateClassOf(g))
+        lst.sort(key=len)
+        return lst
+
+    def rename(self):
         res = np.zeros_like(self.table)
         for i in range(len(self)):
             res[self.Table == self.permutation[i]] = i
@@ -213,19 +179,6 @@ class FiniteGroup:
         plt.show()
 
 
-# G = groupMulTable(data.ex3)
-# G.sortByCoset(G.coset([0, 1, 2, 3])).rename()
-# G.show()
-# Q = G.quotient([0, 1, 2, 3])
-# Q.sortByCoset(Q.coset([0, 10, 12, 16, 20, 23])).rename()
-# Q.show()
-
-with open('ex4.pkl', 'rb') as f:
-    G: FiniteGroup = pkl.load(f)
-# H1 = G.invariantSubgroup([0, 1, 2, 3, 4, 5, 6, 7])
-Q1 = G.quotient([0, 1, 2, 3, 4, 5, 6, 7])
-# H2 = Q1.invariantSubgroup([0, 119, 140, 144, 154, 165, 177, 188])
-Q2 = Q1.quotient([0, 119, 140, 144, 154, 165, 177, 188])
-# H3 = Q2.subgroup([0, 1, 2, 3, 10, 11])
-Q2.groupByCoset([0, 1, 2, 3, 10, 11]).show()
-Q2.groupByCoset([0, 10, 11]).show()
+if __name__ == '__main__':
+    G = makeFiniteGroup(data.ex3)
+    print(G.conjugateClasses())
